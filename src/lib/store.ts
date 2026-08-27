@@ -190,6 +190,25 @@ export class Store {
     this.db.prepare('DELETE FROM edges WHERE source_id = ?').run(nodeId);
   }
 
+  /**
+   * FTS5 把 - " * : ( ) 和 AND/OR/NOT 当语法符号，原样插入 MATCH 会抛异常
+   * （上游 issue #16：查 "Claude-Code" 直接崩）。这里按空白切词后逐词加引号转义，
+   * 词尾的 * 保留在引号外以支持前缀匹配。
+   */
+  private static toFtsQuery(raw: string): string {
+    const tokens = raw.split(/\s+/).filter(Boolean);
+    if (tokens.length === 0) return '""';
+    return tokens
+      .map((tok) => {
+        const prefix = tok.endsWith('*');
+        const body = prefix ? tok.slice(0, -1) : tok;
+        if (!body) return '';
+        return `"${body.replace(/"/g, '""')}"${prefix ? '*' : ''}`;
+      })
+      .filter(Boolean)
+      .join(' ');
+  }
+
   searchFullText(query: string): SearchResult[] {
     return this.db.prepare(`
       SELECT n.id, n.title, rank,
@@ -199,7 +218,7 @@ export class Store {
       WHERE nodes_fts MATCH ?
       ORDER BY rank
       LIMIT 20
-    `).all(query).map((r: any) => ({
+    `).all(Store.toFtsQuery(query)).map((r: any) => ({
       nodeId: r.id,
       title: r.title,
       score: -r.rank,
