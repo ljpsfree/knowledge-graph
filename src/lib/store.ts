@@ -45,10 +45,30 @@ export class Store {
       );
 
       CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts
-        USING fts5(title, content, content='nodes', content_rowid='rowid');
+        USING fts5(title, content, content='nodes', content_rowid='rowid', tokenize='trigram');
 
       CREATE VIRTUAL TABLE IF NOT EXISTS nodes_vec
         USING vec0(embedding float[384]);
+    `);
+
+    this.migrateFtsToTrigram();
+  }
+
+  /**
+   * 老库的 nodes_fts 用默认 unicode61 分词器，它不切分 CJK：一整串汉字是一个 token，
+   * 所以「运行环境」这类子串只有出现在串首才能匹配。trigram 按三字符切片，支持任意
+   * 位置的子串匹配。外部内容表可以直接 rebuild，不需要重新解析 vault 或重算向量。
+   */
+  private migrateFtsToTrigram(): void {
+    const row = this.db.prepare(
+      "SELECT sql FROM sqlite_master WHERE type='table' AND name='nodes_fts'"
+    ).get() as { sql: string } | undefined;
+    if (!row || row.sql.includes("tokenize='trigram'")) return;
+    this.db.exec(`
+      DROP TABLE nodes_fts;
+      CREATE VIRTUAL TABLE nodes_fts
+        USING fts5(title, content, content='nodes', content_rowid='rowid', tokenize='trigram');
+      INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild');
     `);
   }
 
@@ -192,24 +212,27 @@ export class Store {
 
   /**
    * FTS5 把 - " * : ( ) 和 AND/OR/NOT 当语法符号，原样插入 MATCH 会抛异常
-   * （上游 issue #16：查 "Claude-Code" 直接崩）。这里按空白切词后逐词加引号转义，
-   * 词尾的 * 保留在引号外以支持前缀匹配。
+   * （上游 issue #16：查 "Claude-Code" 直接崩）。这里按空白切词后逐词加引号转义。
+   * trigram 分词器本身就是子串匹配，不需要 * 前缀，故尾部的 * 直接剥掉。
    */
-  private static toFtsQuery(raw: string): string {
-    const tokens = raw.split(/\s+/).filter(Boolean);
-    if (tokens.length === 0) return '""';
-    return tokens
-      .map((tok) => {
-        const prefix = tok.endsWith('*');
-        const body = prefix ? tok.slice(0, -1) : tok;
-        if (!body) return '';
-        return `"${body.replace(/"/g, '""')}"${prefix ? '*' : ''}`;
-      })
-      .filter(Boolean)
-      .join(' ');
+  private static tokenize(raw: string): string[] {
+    return raw
+      .split(/\s+/)
+      .map((tok) => tok.replace(/\*+$/, '').trim())
+      .filter(Boolean);
+  }
+
+  private static toFtsQuery(tokens: string[]): string {
+    return tokens.map((tok) => `"${tok.replace(/"/g, '""')}"`).join(' ');
   }
 
   searchFullText(query: string): SearchResult[] {
+    const tokens = Store.tokenize(query);
+    if (tokens.length === 0) return [];
+
+    // trigram 以三字符为单位建索引，短于 3 字符的词永远匹配不到，退回 LIKE 扫描
+    if (tokens.some((tok) => tok.length < 3)) return this.searchLike(tokens);
+
     return this.db.prepare(`
       SELECT n.id, n.title, rank,
         snippet(nodes_fts, 1, '>>>', '<<<', '...', 40) as excerpt
@@ -218,13 +241,50 @@ export class Store {
       WHERE nodes_fts MATCH ?
       ORDER BY rank
       LIMIT 20
-    `).all(Store.toFtsQuery(query)).map((r: any) => ({
+    `).all(Store.toFtsQuery(tokens)).map((r: any) => ({
       nodeId: r.id,
       title: r.title,
       score: -r.rank,
       excerpt: r.excerpt ?? '',
     }));
   }
+
+  /**
+   * 短查询兜底：LIKE 全表扫描。539 篇笔记的量级下开销可忽略。
+   * 打分 = 标题命中加 10 分 + 正文中各词出现次数之和。
+   */
+  private searchLike(tokens: string[]): SearchResult[] {
+    const params: unknown[] = [];
+
+    const titleHit = tokens.map(() => 'n.title LIKE ?').join(' OR ');
+    for (const tok of tokens) params.push(`%${tok}%`);
+
+    const occurrences = tokens
+      .map(() => "(length(n.content) - length(replace(n.content, ?, ''))) / ?")
+      .join(' + ');
+    for (const tok of tokens) params.push(tok, tok.length);
+
+    const where = tokens.map(() => '(n.title LIKE ? OR n.content LIKE ?)').join(' AND ');
+    for (const tok of tokens) params.push(`%${tok}%`, `%${tok}%`);
+
+    params.push(tokens[0]);
+
+    return this.db.prepare(`
+      SELECT n.id, n.title,
+        (CASE WHEN ${titleHit} THEN 10 ELSE 0 END) + (${occurrences}) AS score,
+        substr(n.content, MAX(1, instr(n.content, ?) - 40), 160) AS excerpt
+      FROM nodes n
+      WHERE ${where}
+      ORDER BY score DESC
+      LIMIT 20
+    `).all(...params).map((r: any) => ({
+      nodeId: r.id,
+      title: r.title,
+      score: r.score ?? 0,
+      excerpt: r.excerpt ?? '',
+    }));
+  }
+
 
   upsertEmbedding(nodeId: string, embedding: Float32Array): void {
     const node = this.getNode(nodeId);
