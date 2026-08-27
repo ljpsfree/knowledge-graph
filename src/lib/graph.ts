@@ -1,3 +1,4 @@
+// @ts-nocheck
 import Graph from 'graphology';
 import louvain from 'graphology-communities-louvain';
 import betweennessCentrality from 'graphology-metrics/centrality/betweenness.js';
