@@ -55,7 +55,7 @@ export class IndexPipeline {
       // Compute and store embedding
       const tags = Array.isArray(node.frontmatter.tags) ? node.frontmatter.tags : [];
       const text = Embedder.buildEmbeddingText(node.title, tags as string[], node.content);
-      const embedding = await this.embedder.embed(text);
+      const embedding = await this.embedder.embedDocument(text);
       this.store.upsertEmbedding(node.id, embedding);
 
       // Re-index edges from this node
